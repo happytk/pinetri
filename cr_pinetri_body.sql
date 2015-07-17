@@ -15,39 +15,47 @@ is
         l_return t_tf_row;
     begin
 
-        if v_sid = 0 then
---            select sysdate,
---                   value
---              into
---                   l_return.gen_dt,
---                   l_return.logrds
---            from   v$sysstat
---            where  STATISTIC# in (12,588);
-            select systimestamp, logrds, exec
-               into l_return.gen_dt, l_return.logrds, l_return.exec
-            from (
-                select *
-                from (
-                    select statistic#,
-                           value
-                    from   v$sysstat
-                    where  STATISTIC# in (12,588)
-                )
-                pivot (sum(value) for (statistic#) in (12 as logrds, 588 as exec))
-            ) a
+            select systimestamp into l_return.gen_dt from dual;
+            select value into l_return.cpu_idle
+            from v$osstat
+            where stat_name in ('IDLE_TIME')
             ;
+
+            select value into l_return.cpu_busy
+            from v$osstat
+            where stat_name in ('BUSY_TIME')
+            ;
+
+        if v_sid = 0 then
+            select value into l_return.logrds
+              from v$sysstat where stat_id = 3143187968;
+            select value into l_return.phyrds
+              from v$sysstat where stat_id = 2263124246;
+            select value into l_return.exec
+              from v$sysstat where stat_id = 2453370665;
 
             select sum(decode(status, 'ACTIVE', 1, 0)) ats
               into l_return.ats
               from v$session where username is not null;
 
-            select nvl(sum(seconds_in_wait),0) apco
-              into l_return.apco
-              from v$session_wait where state='WAITING' and wait_class in ('Application', 'Concurrency');
+            select nvl(sum(decode(wait_class, 'Application', ws, 0, 0)),0) ap,
+                   nvl(sum(decode(wait_class, 'Concurrency', ws, 0, 0)),0) co
+              into l_return.ap, l_return.co
+              from (
+            select wait_class, nvl(sum(seconds_in_wait),0) ws
+              from v$session_wait where state='WAITING' and wait_class in ('Application', 'Concurrency')
+               group by wait_class
+               )
+              ;
 
-            select nvl(sum(used_urec),0)
-              into l_return.undo_rec
+            select nvl(sum(used_urec),0), nvl(count(*), 0)
+              into l_return.undo_rec, l_return.tx_cnt
               from v$transaction;
+
+            select trunc(sum(value)/1048576)
+              into l_return.pga_mb
+              from v$sesstat s, v$statname n
+            where n.name = 'session pga memory' and s.statistic# = n.statistic#;
 
             select evt
               into l_return.event
@@ -60,20 +68,22 @@ is
              ) where rownum = 1
              ;
         else
-            select systimestamp, logrds, exec
-               into l_return.gen_dt, l_return.logrds, l_return.exec
-            from (
-                select *
-                from (
-                    select statistic#,
-                           sum(value) sv
-                    from   v$sesstat
-                    where  STATISTIC# in (12,588)
-                      and  (sid in (select sid from v$px_session where qcsid = v_sid) or sid = v_sid)
-                    group by statistic#
-                )
-                pivot (sum(sv) for (statistic#) in (12 as logrds, 588 as exec))
-            ) a
+            select sum(value) into l_return.logrds
+            from v$sesstat s, v$statname n
+            where n.name = 'session logical reads' and s.statistic# = n.statistic#
+              and (sid in (select sid from v$px_session where qcsid = v_sid) or sid = v_sid)
+            ;
+
+            select sum(value) into l_return.phyrds
+            from v$sesstat s, v$statname n
+            where n.name = 'physical reads' and s.statistic# = n.statistic#
+              and (sid in (select sid from v$px_session where qcsid = v_sid) or sid = v_sid)
+            ;
+
+            select sum(value) into l_return.exec
+            from v$sesstat s, v$statname n
+            where n.name = 'execute count' and s.statistic# = n.statistic#
+              and (sid in (select sid from v$px_session where qcsid = v_sid) or sid = v_sid)
             ;
 
             select sum(decode(status, 'ACTIVE', 1, 0)) ats
@@ -82,16 +92,28 @@ is
                and  (sid in (select sid from v$px_session where qcsid = v_sid) or sid = v_sid)
                ;
 
-            select nvl(sum(seconds_in_wait),0) apco
-              into l_return.apco
+            select nvl(sum(decode(wait_class, 'Application', ws, 0, 0)),0) ap,
+                   nvl(sum(decode(wait_class, 'Concurrency', ws, 0, 0)),0) co
+              into l_return.ap, l_return.co
+              from (
+            select wait_class, nvl(sum(seconds_in_wait),0) ws
               from v$session_wait where state='WAITING' and wait_class in ('Application', 'Concurrency')
                and (sid in (select sid from v$px_session where qcsid = v_sid) or sid = v_sid)
+               group by wait_class
+               )
               ;
 
-            select nvl(sum(t.used_urec), 0)
-              into l_return.undo_rec
+            select nvl(sum(t.used_urec), 0), nvl(count(t.addr), 0)
+              into l_return.undo_rec, l_return.tx_cnt
               from v$transaction t, v$session s
              where s.taddr = t.addr
+               and (s.sid in (select sid from v$px_session where qcsid = v_sid) or s.sid = v_sid)
+               ;
+
+            select trunc(sum(value)/1048576)
+              into l_return.pga_mb
+              from v$sesstat s, v$statname n
+            where n.name = 'session pga memory' and s.statistic# = n.statistic#
                and (s.sid in (select sid from v$px_session where qcsid = v_sid) or s.sid = v_sid)
                ;
 
@@ -113,12 +135,19 @@ is
         -- dbms_output.put_line('delta-seconds:' || to_char(l_delta));
         -- l_return := after - before;
         l_return.logrds := round((after.logrds - before.logrds)/l_delta);
+        l_return.phyrds := round((after.phyrds - before.phyrds)/l_delta);
         l_return.exec := round((after.exec - before.exec)/l_delta);
 
+        l_return.cpu_busy := round(after.cpu_busy - before.cpu_busy);
+        l_return.cpu_idle := round(after.cpu_busy - before.cpu_busy);
+        l_return.cpu := trunc(l_return.cpu_busy*100/(l_return.cpu_busy + l_return.cpu_idle));
         l_return.ats := after.ats;
-        l_return.apco := after.apco;
+        l_return.tx_cnt := after.tx_cnt;
+        l_return.ap := after.ap;
+        l_return.co := after.co;
         l_return.gen_dt := after.gen_dt;
         l_return.undo_rec := after.undo_rec;
+        l_return.pga_mb := after.pga_mb;
         l_return.event := after.event;
         return l_return;
     end;
